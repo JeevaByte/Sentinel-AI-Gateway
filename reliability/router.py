@@ -11,9 +11,9 @@ This module exposes:
 
 from __future__ import annotations
 
-import asyncio
+import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -21,6 +21,8 @@ import httpx
 
 from config import ProviderConfig, load_provider_configs
 from models.schemas import ChatResponse, ProviderStatus
+
+logger = logging.getLogger(__name__)
 
 
 class CircuitState(str, Enum):
@@ -50,7 +52,7 @@ class _CircuitBreaker:
 
     def record_failure(self) -> None:
         self.failure_count += 1
-        self.last_failure = datetime.utcnow()
+        self.last_failure = datetime.now(timezone.utc)
         if self.failure_count >= _FAILURE_THRESHOLD:
             self.state = CircuitState.OPEN
             self._opened_at = time.monotonic()
@@ -97,7 +99,7 @@ async def _call_provider(provider: ProviderConfig, prompt: str) -> str:
     if name == "openai":
         headers["Authorization"] = f"Bearer {provider.api_key}"
         payload = {
-            "model": "gpt-4o-mini",
+            "model": provider.model,
             "messages": [{"role": "user", "content": prompt}],
         }
         url = f"{provider.base_url}/chat/completions"
@@ -105,7 +107,7 @@ async def _call_provider(provider: ProviderConfig, prompt: str) -> str:
         headers["x-api-key"] = provider.api_key
         headers["anthropic-version"] = "2023-06-01"
         payload = {
-            "model": "claude-3-haiku-20240307",
+            "model": provider.model,
             "max_tokens": 1024,
             "messages": [{"role": "user", "content": prompt}],
         }
@@ -113,18 +115,18 @@ async def _call_provider(provider: ProviderConfig, prompt: str) -> str:
     elif name == "gemini":
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
         url = (
-            f"{provider.base_url}/models/gemini-1.5-flash:generateContent"
+            f"{provider.base_url}/models/{provider.model}:generateContent"
             f"?key={provider.api_key}"
         )
     elif name == "crusoe":
         headers["Authorization"] = f"Bearer {provider.api_key}"
         payload = {
-            "model": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+            "model": provider.model,
             "messages": [{"role": "user", "content": prompt}],
         }
         url = f"{provider.base_url}/chat/completions"
     elif name == "ollama":
-        payload = {"model": "llama3", "prompt": prompt, "stream": False}
+        payload = {"model": provider.model, "prompt": prompt, "stream": False}
         url = f"{provider.base_url}/api/generate"
     else:
         raise ValueError(f"Unknown provider: {name}")
@@ -135,7 +137,7 @@ async def _call_provider(provider: ProviderConfig, prompt: str) -> str:
         data = resp.json()
 
     # Extract text from provider-specific response shape
-    if name == "openai" or name == "crusoe":
+    if name in ("openai", "crusoe"):
         return data["choices"][0]["message"]["content"]
     elif name == "anthropic":
         return data["content"][0]["text"]
@@ -161,30 +163,43 @@ class ProviderRouter:
         for provider in _providers:
             breaker = _breakers[provider.name]
             if not breaker.is_available():
+                logger.debug("Skipping provider %s – circuit is %s", provider.name, breaker.state)
                 continue
 
             if attempt_count > 0:
                 fallback_triggered = True
-            attempt_count += 1
 
-            try:
-                text = await _call_provider(provider, prompt)
-                breaker.record_success()
-                latency_ms = (time.monotonic() - start) * 1000
-                return ChatResponse(
-                    response=text,
-                    provider_used=provider.name,
-                    latency_ms=round(latency_ms, 2),
-                    fallback_triggered=fallback_triggered,
-                    attempt_count=attempt_count,
-                )
-            except Exception as exc:  # noqa: BLE001
-                breaker.record_failure()
-                last_error = exc
+            for retry in range(provider.max_retries):
+                attempt_count += 1
+                try:
+                    text = await _call_provider(provider, prompt)
+                    breaker.record_success()
+                    latency_ms = (time.monotonic() - start) * 1000
+                    return ChatResponse(
+                        response=text,
+                        provider_used=provider.name,
+                        latency_ms=round(latency_ms, 2),
+                        fallback_triggered=fallback_triggered,
+                        attempt_count=attempt_count,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Provider %s failed on attempt %d/%d: %s: %s",
+                        provider.name,
+                        retry + 1,
+                        provider.max_retries,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    breaker.record_failure()
+                    last_error = exc
+                    if not breaker.is_available():
+                        # Circuit just opened – no point retrying this provider
+                        break
 
         raise RuntimeError(
             f"All providers exhausted after {attempt_count} attempt(s). "
-            f"Last error: {last_error}"
+            f"Last error: {type(last_error).__name__}: {last_error}"
         )
 
 
